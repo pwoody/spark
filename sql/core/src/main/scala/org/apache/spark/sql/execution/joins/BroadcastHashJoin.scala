@@ -17,9 +17,10 @@
 
 package org.apache.spark.sql.execution.joins
 
+import org.apache.spark.broadcast.Broadcast
+
 import scala.concurrent._
 import scala.concurrent.duration._
-
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.Expression
@@ -66,35 +67,49 @@ case class BroadcastHashJoin(
   // for the same query.
   @transient
   private lazy val broadcastFuture = {
-    val numBuildRows = buildSide match {
-      case BuildLeft => longMetric("numLeftRows")
-      case BuildRight => longMetric("numRightRows")
-    }
-
     // broadcastFuture is used in "doExecute". Therefore we can get the execution id correctly here.
     val executionId = sparkContext.getLocalProperty(SQLExecution.EXECUTION_ID_KEY)
     future {
       // This will run in another thread. Set the execution id so that we can connect these jobs
       // with the correct execution.
       SQLExecution.withExecutionId(sparkContext, executionId) {
-        // Note that we use .execute().collect() because we don't want to convert data to Scala
-        // types
-        val input: Array[InternalRow] = buildPlan.execute().map { row =>
-          numBuildRows += 1
-          row.copy()
-        }.collect()
-        // The following line doesn't run in a job so we cannot track the metric value. However, we
-        // have already tracked it in the above lines. So here we can use
-        // `SQLMetrics.nullLongMetric` to ignore it.
-        val hashed = HashedRelation(
-          input.iterator, SQLMetrics.nullLongMetric, buildSideKeyGenerator, input.size)
-        sparkContext.broadcast(hashed)
+        doBroadcast()
       }
     }(BroadcastHashJoin.broadcastHashJoinExecutionContext)
   }
 
+  @transient
+  private lazy val broadcastRelation = {
+    if (sqlContext.conf.autoBroadcastJoinLazy) {
+      doBroadcast()
+    } else {
+      Await.result(broadcastFuture, timeout)
+    }
+  }
+
+  private def doBroadcast(): Broadcast[HashedRelation] = {
+    val numBuildRows = buildSide match {
+      case BuildLeft => longMetric("numLeftRows")
+      case BuildRight => longMetric("numRightRows")
+    }
+    // Note that we use .execute().collect() because we don't want to convert data to Scala
+    // types
+    val input: Array[InternalRow] = buildPlan.execute().map { row =>
+      numBuildRows += 1
+      row.copy()
+    }.collect()
+    // The following line doesn't run in a job so we cannot track the metric value. However, we
+    // have already tracked it in the above lines. So here we can use
+    // `SQLMetrics.nullLongMetric` to ignore it.
+    val hashed = HashedRelation(
+      input.iterator, SQLMetrics.nullLongMetric, buildSideKeyGenerator, input.size)
+    sparkContext.broadcast(hashed)
+  }
+
   protected override def doPrepare(): Unit = {
-    broadcastFuture
+    if (!sqlContext.conf.autoBroadcastJoinLazy) {
+      broadcastFuture
+    }
   }
 
   protected override def doExecute(): RDD[InternalRow] = {
@@ -103,8 +118,6 @@ case class BroadcastHashJoin(
       case BuildRight => longMetric("numLeftRows")
     }
     val numOutputRows = longMetric("numOutputRows")
-
-    val broadcastRelation = Await.result(broadcastFuture, timeout)
 
     streamedPlan.execute().mapPartitions { streamedIter =>
       val hashedRelation = broadcastRelation.value
@@ -121,6 +134,6 @@ case class BroadcastHashJoin(
 
 object BroadcastHashJoin {
 
-  private[joins] val broadcastHashJoinExecutionContext = ExecutionContext.fromExecutorService(
+  private[joins] lazy val broadcastHashJoinExecutionContext = ExecutionContext.fromExecutorService(
     ThreadUtils.newDaemonCachedThreadPool("broadcast-hash-join", 128))
 }
