@@ -447,7 +447,7 @@ case class FileSourceScanExec(
 
       if (format.isSplitable(session, relation.options, file.getPath)) {
         val validSplits = format.getSplits(relation.location, file,
-          dataFilters, schema, session.sparkContext.hadoopConfiguration)
+          dataFilters, schema, session.sessionState.newHadoopConf())
         validSplits.map { split =>
           val hosts = getBlockHosts(blockLocations, split.getStart, split.getLength)
           PartitionedFile(values, filePath, split.getStart, split.getLength, hosts)
@@ -503,7 +503,7 @@ case class FileSourceScanExec(
       // If the format is splittable, attempt to split and filter the file.
       if (fsRelation.fileFormat.isSplitable(session, fsRelation.options, file.getPath)) {
         val validSplits = relation.fileFormat.getSplits(relation.location, file,
-          dataFilters, schema, session.sparkContext.hadoopConfiguration)
+          dataFilters, schema, session.sessionState.newHadoopConf())
         validSplits.flatMap { split =>
           val splitOffset = split.getStart
           val end = splitOffset + split.getLength
