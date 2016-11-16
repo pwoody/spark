@@ -29,7 +29,7 @@ import org.apache.hadoop.fs.{FileStatus, Path}
 import org.apache.hadoop.mapreduce._
 import org.apache.hadoop.mapreduce.lib.input.FileSplit
 import org.apache.hadoop.mapreduce.task.TaskAttemptContextImpl
-import org.apache.parquet.filter2.compat.{FilterCompat, RowGroupFilter}
+import org.apache.parquet.filter2.compat.FilterCompat
 import org.apache.parquet.filter2.predicate.FilterApi
 import org.apache.parquet.format.converter.ParquetMetadataConverter
 import org.apache.parquet.hadoop._
@@ -62,10 +62,8 @@ class ParquetFileFormat
   // here.
   private val parquetLogRedirector = ParquetLogRedirector.INSTANCE
 
-  @transient private val cachedMetadata: mutable.LinkedHashMap[Path, Option[ParquetMetadata]] =
-    new mutable.LinkedHashMap[Path, Option[ParquetMetadata]]
-  @transient private val filterBlockCache: mutable.LinkedHashMap[FilterCacheKey, Seq[FileSplit]] =
-    new mutable.LinkedHashMap[FilterCacheKey, Seq[FileSplit]]
+  @transient private val fileSplits: mutable.LinkedHashMap[Path, ParquetFileSplits] =
+    new mutable.LinkedHashMap[Path, ParquetFileSplits]
 
   override def shortName(): String = "parquet"
 
@@ -293,61 +291,28 @@ class ParquetFileFormat
       filters: Seq[Filter],
       schema: StructType,
       hadoopConf: Configuration): Seq[FileSplit] = {
-    if (filters.isEmpty || !sparkSession.sessionState.conf.parquetPartitionPruningEnabled) {
+    val filePath = fileStatus.getPath
+    val root: Option[Path] = fileIndex.rootPaths
+      .find(root => filePath.toString.startsWith(root.toString))
+    val pruningEnabled = sparkSession.sessionState.conf.parquetPartitionPruningEnabled
+    if (!pruningEnabled || filters.isEmpty || root.isEmpty) {
       // Return immediately to save FileSystem overhead
       super.getSplits(sparkSession, fileIndex, fileStatus, filters, schema, hadoopConf)
     } else {
-      val filePath = fileStatus.getPath
-      val rootOption: Option[Path] = fileIndex.rootPaths
-        .find(root => filePath.toString.startsWith(root.toString))
-      val metadataOption = rootOption.flatMap { root =>
-        cachedMetadata.getOrElseUpdate(root, getMetadataForPath(root, hadoopConf))
-      }
-      // If the metadata exists, filter the splits.
-      // Otherwise, fall back to the default implementation.
-      metadataOption
-        .map(filterToSplits(fileStatus, _, rootOption.get, filters, schema, hadoopConf))
-        .getOrElse(super.getSplits(sparkSession, fileIndex, fileStatus,
-          filters, schema, hadoopConf))
+      val fileRoot = root.get
+      val parquetSplits = fileSplits.getOrElseUpdate(fileRoot,
+        createParquetFileSplits(fileRoot, hadoopConf, schema))
+      parquetSplits.getSplits(fileStatus, filters)
     }
   }
 
-  private case class FilterCacheKey(filter: Seq[Filter], rootPath: Path)
-
-  private def filterToSplits(
-      fileStatus: FileStatus,
-      metadata: ParquetMetadata,
-      metadataRoot: Path,
-      filters: Seq[Filter],
-      schema: StructType,
-      hadoopConf: Configuration): Seq[FileSplit] = {
-    val metadataBlocks = metadata.getBlocks
-
-    // Ensure that the metadata has an entry for the file.
-    // If it does not, do not filter at this stage.
-    val metadataContainsPath = metadataBlocks.asScala.exists { bmd =>
-      new Path(metadataRoot, bmd.getPath) == fileStatus.getPath
-    }
-    if (!metadataContainsPath) {
-      log.warn(s"Found _metadata file for $metadataRoot," +
-        s" but no entries for blocks in ${fileStatus.getPath}. Retaining whole file.")
-      return Seq(new FileSplit(fileStatus.getPath, 0, fileStatus.getLen, Array.empty))
-    }
-    val key = FilterCacheKey(filters, metadataRoot)
-    def filterBlocks(): Seq[FileSplit] = {
-      val parquetSchema = metadata.getFileMetaData.getSchema
-      val filter = FilterCompat.get(filters
-        .flatMap(ParquetFilters.createFilter(schema, _))
-        .reduce(FilterApi.and))
-      val filteredMetadata =
-        RowGroupFilter.filterRowGroups(filter, metadataBlocks, parquetSchema).asScala
-      filteredMetadata.map { bmd =>
-        val bmdPath = new Path(metadataRoot, bmd.getPath)
-        new FileSplit(bmdPath, bmd.getStartingPos, bmd.getTotalByteSize, Array.empty)
-      }
-    }
-    val eligibleSplits = filterBlockCache.getOrElseUpdate(key, filterBlocks())
-    eligibleSplits.filter(_.getPath == fileStatus.getPath)
+  private def createParquetFileSplits(
+    root: Path,
+    hadoopConf: Configuration,
+    schema: StructType): ParquetFileSplits = {
+    getMetadataForPath(root, hadoopConf)
+      .map(meta => new ParquetMetadataFileSplits(root, meta, schema))
+      .getOrElse(ParquetDefaultFileSplits)
   }
 
   private def getMetadataForPath(
